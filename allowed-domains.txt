@@ -1,0 +1,8 @@
+# Runtime egress allowlist for the first version.
+# Keep this list short and explicit.
+
+api.openai.com
+platform.openai.com
+chatgpt.com
+github.com
+api.github.com

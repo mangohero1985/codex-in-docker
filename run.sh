@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+IMAGE="codex-in-docker:local"
+HOME_IN_CONTAINER="/home/dev"
+WORKSPACE_IN_CONTAINER="${HOME_IN_CONTAINER}/workspace"
+CODEX_HOME_IN_CONTAINER="${HOME_IN_CONTAINER}/.codex"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(pwd -P)"
+NETWORK_MODE="${CODEX_NETWORK_MODE:-none}"
+ROOTFS_MODE="${CODEX_ROOTFS_MODE:-readonly}"
+MCP_OAUTH_CALLBACK_PORT="${CODEX_MCP_OAUTH_CALLBACK_PORT:-}"
+RUNTIME_STATE_DIR="${SCRIPT_DIR}/.tmp/runtime"
+PASSWD_FILE="${RUNTIME_STATE_DIR}/passwd"
+GROUP_FILE="${RUNTIME_STATE_DIR}/group"
+PROJECT_HASH_INPUT="${PROJECT_DIR}"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+PRINT_CODEX_HOME_VOLUME=false
+if [[ "${1:-}" == "--print-codex-home-volume" ]]; then
+  PRINT_CODEX_HOME_VOLUME=true
+fi
+ALLOWED_PASSTHROUGH_ENVS=(
+  CODEX_ACCESS_TOKEN
+  CODEX_API_KEY
+  CODEX_CA_CERTIFICATE
+)
+HOST_CODEX_DIR="${HOME}/.codex"
+HOST_CODEX_IMPORT_ITEMS=(
+  config.toml
+  prompts
+  rules
+  skills
+)
+SENSITIVE_HOST_PATHS=(
+  "${HOME}/.ssh"
+  "${HOME}/.aws"
+  "${HOME}/.azure"
+  "${HOME}/.config/gcloud"
+  "${HOME}/.config/gh"
+  "${HOME}/.docker"
+  "${HOME}/.gnupg"
+  "${HOME}/.kube"
+  "${HOME}/Library/Keychains"
+  "/run"
+  "/var/run"
+)
+SENSITIVE_HOST_ENVS=(
+  SSH_AUTH_SOCK
+  AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN
+  AWS_PROFILE
+  GITHUB_TOKEN
+  GH_TOKEN
+  GOOGLE_APPLICATION_CREDENTIALS
+  AZURE_CLIENT_SECRET
+  AZURE_TENANT_ID
+  AZURE_CLIENT_ID
+  KUBECONFIG
+  DOCKER_HOST
+  DOCKER_CERT_PATH
+  GNUPGHOME
+)
+
+canonicalize_dir() {
+  local path="$1"
+  [[ -d "${path}" ]] || return 1
+  (cd "${path}" && pwd -P)
+}
+
+assert_safe_project_dir() {
+  local project_dir="$1"
+  local sensitive
+  local resolved_sensitive
+
+  for sensitive in "${SENSITIVE_HOST_PATHS[@]}"; do
+    if ! resolved_sensitive="$(canonicalize_dir "${sensitive}")"; then
+      continue
+    fi
+
+    case "${project_dir}" in
+      "${resolved_sensitive}"|"${resolved_sensitive}"/*)
+        cat >&2 <<EOF
+[security] refusing to mount sensitive host path: ${project_dir}
+[security] blocked because it is inside: ${resolved_sensitive}
+[security] clone the repository into a dedicated workspace directory and run codex-in-docker from there.
+EOF
+        exit 1
+        ;;
+    esac
+  done
+}
+
+warn_ignored_sensitive_host_envs() {
+  local env_name
+  local warned=()
+
+  for env_name in "${SENSITIVE_HOST_ENVS[@]}"; do
+    if [[ -n "${!env_name:-}" ]]; then
+      warned+=("${env_name}")
+    fi
+  done
+
+  if [[ "${#warned[@]}" -gt 0 ]]; then
+    printf '[security] host secret env vars detected but not forwarded: %s\n' "${warned[*]}" >&2
+    echo "[security] only explicit Codex auth env vars are passed through to the container." >&2
+  fi
+}
+
+prepare_host_codex_seed_dir() {
+  local seed_dir="${RUNTIME_STATE_DIR}/host-codex-seed"
+  local item
+
+  rm -rf "${seed_dir}"
+  mkdir -p "${seed_dir}"
+
+  [[ -d "${HOST_CODEX_DIR}" ]] || return 0
+
+  for item in "${HOST_CODEX_IMPORT_ITEMS[@]}"; do
+    if [[ -e "${HOST_CODEX_DIR}/${item}" ]]; then
+      cp -R "${HOST_CODEX_DIR}/${item}" "${seed_dir}/${item}"
+    fi
+  done
+}
+
+seed_codex_home_volume_if_needed() {
+  local seed_dir="${RUNTIME_STATE_DIR}/host-codex-seed"
+  local first_seed_entry
+
+  [[ -d "${seed_dir}" ]] || return 0
+  first_seed_entry="$(find "${seed_dir}" -mindepth 1 -print -quit)"
+  [[ -n "${first_seed_entry}" ]] || return 0
+
+  docker run --rm \
+    --entrypoint bash \
+    --env "HOST_UID=${HOST_UID}" \
+    --env "HOST_GID=${HOST_GID}" \
+    --volume "${CODEX_HOME_VOLUME}:${CODEX_HOME_IN_CONTAINER}" \
+    --volume "${seed_dir}:/seed:ro" \
+    "${IMAGE}" \
+    -lc '
+      set -euo pipefail
+      marker="'"${CODEX_HOME_IN_CONTAINER}"'/.host-config-imported"
+
+      if [[ -e "$marker" ]]; then
+        exit 0
+      fi
+
+      mkdir -p "'"${CODEX_HOME_IN_CONTAINER}"'"
+      shopt -s dotglob nullglob
+      for item in /seed/*; do
+        base="$(basename "$item")"
+        rm -rf "'"${CODEX_HOME_IN_CONTAINER}"'/$base"
+        cp -R "$item" "'"${CODEX_HOME_IN_CONTAINER}"'/$base"
+      done
+      date -u +"%Y-%m-%dT%H:%M:%SZ" > "$marker"
+      chown -R "${HOST_UID}:${HOST_GID}" "'"${CODEX_HOME_IN_CONTAINER}"'"
+      chmod 700 "'"${CODEX_HOME_IN_CONTAINER}"'"
+      find "'"${CODEX_HOME_IN_CONTAINER}"'" -type d -exec chmod 755 {} \;
+      find "'"${CODEX_HOME_IN_CONTAINER}"'" -type f -exec chmod 644 {} \;
+      chmod 600 "'"${CODEX_HOME_IN_CONTAINER}"'/auth.json 2>/dev/null || true
+      chmod 600 "'"${CODEX_HOME_IN_CONTAINER}"'/config.toml 2>/dev/null || true
+    '
+
+  echo ">> imported host Codex config into volume: ${CODEX_HOME_VOLUME}"
+}
+
+context_hash() {
+  local files=(
+    "${SCRIPT_DIR}/Dockerfile"
+    "${SCRIPT_DIR}/entrypoint.sh"
+    "${SCRIPT_DIR}/init-firewall.sh"
+    "${SCRIPT_DIR}/allowed-domains.txt"
+    "${SCRIPT_DIR}/run.sh"
+  )
+  local existing=()
+  local file
+
+  for file in "${files[@]}"; do
+    [[ -f "${file}" ]] && existing+=("${file}")
+  done
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${existing[@]}"
+  else
+    shasum -a 256 "${existing[@]}"
+  fi | sha256sum | cut -c1-16
+}
+
+CURRENT_HASH="$(context_hash)"
+IMAGE_HASH="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "build.context-hash"}}' 2>/dev/null || true)"
+
+if [[ "${PRINT_CODEX_HOME_VOLUME}" != true ]]; then
+  assert_safe_project_dir "${PROJECT_DIR}"
+  warn_ignored_sensitive_host_envs
+fi
+
+if [[ "${IMAGE_HASH}" != "${CURRENT_HASH}" ]]; then
+  if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
+    echo "codex-in-docker image is outdated; run the launcher normally once to rebuild it." >&2
+    exit 1
+  fi
+  if [[ -n "${IMAGE_HASH}" ]]; then
+    echo ">> build context changed; rebuilding ${IMAGE}"
+  else
+    echo ">> building ${IMAGE}"
+  fi
+  docker build --tag "${IMAGE}" --label "build.context-hash=${CURRENT_HASH}" "${SCRIPT_DIR}"
+fi
+
+mkdir -p "${RUNTIME_STATE_DIR}"
+cat > "${PASSWD_FILE}" <<EOF
+root:x:0:0:root:/root:/bin/bash
+dev:x:$(id -u):$(id -g):dev:${HOME_IN_CONTAINER}:/bin/bash
+EOF
+cat > "${GROUP_FILE}" <<EOF
+root:x:0:
+dev:x:$(id -g):
+EOF
+
+DOCKER_NETWORK_ARGS=()
+DOCKER_PUBLISH_ARGS=()
+DOCKER_ENV_ARGS=(
+  --env "HOME=${HOME_IN_CONTAINER}"
+  --env "COLORTERM=truecolor"
+  --env "CODEX_NETWORK_MODE=${NETWORK_MODE}"
+  --env "CODEX_ROOTFS_MODE=${ROOTFS_MODE}"
+  --env "CODEX_HOME=${CODEX_HOME_IN_CONTAINER}"
+)
+DOCKER_MOUNT_ARGS=(
+  --volume "${PROJECT_DIR}:${WORKSPACE_IN_CONTAINER}"
+  --volume "${PASSWD_FILE}:/etc/passwd:ro"
+  --volume "${GROUP_FILE}:/etc/group:ro"
+)
+DOCKER_ROOTFS_ARGS=()
+
+if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
+  if [[ ! "${MCP_OAUTH_CALLBACK_PORT}" =~ ^[0-9]+$ ]]; then
+    echo "unsupported CODEX_MCP_OAUTH_CALLBACK_PORT: ${MCP_OAUTH_CALLBACK_PORT}" >&2
+    echo "expected an integer TCP port" >&2
+    exit 1
+  fi
+  if [[ "${NETWORK_MODE}" == "none" ]]; then
+    echo "CODEX_MCP_OAUTH_CALLBACK_PORT requires network access; use CODEX_NETWORK_MODE=direct or firewall" >&2
+    exit 1
+  fi
+  DOCKER_PUBLISH_ARGS+=(--publish "127.0.0.1:${MCP_OAUTH_CALLBACK_PORT}:${MCP_OAUTH_CALLBACK_PORT}")
+fi
+
+path_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -c1-10
+  else
+    printf '%s' "$1" | shasum -a 256 | cut -c1-10
+  fi
+}
+
+SAFE_NAME="$(printf '%s' "$(basename "${PROJECT_DIR}")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
+SAFE_NAME="$(printf '%s' "${SAFE_NAME}" | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+CODEX_HOME_VOLUME="${CODEX_HOME_VOLUME:-codex-home-${SAFE_NAME:-repo}-$(path_hash "${PROJECT_HASH_INPUT}")}"
+DOCKER_MOUNT_ARGS+=(--volume "${CODEX_HOME_VOLUME}:${CODEX_HOME_IN_CONTAINER}")
+
+if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
+  printf '%s\n' "${CODEX_HOME_VOLUME}"
+  exit 0
+fi
+
+prepare_host_codex_seed_dir
+seed_codex_home_volume_if_needed
+
+echo ">> project: ${PROJECT_DIR}"
+echo ">> codex home volume: ${CODEX_HOME_VOLUME}"
+if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
+  echo ">> mcp oauth callback port: ${MCP_OAUTH_CALLBACK_PORT}"
+fi
+
+for maybe_env in "${ALLOWED_PASSTHROUGH_ENVS[@]}"; do
+  if [[ -n "${!maybe_env:-}" ]]; then
+    DOCKER_ENV_ARGS+=(--env "${maybe_env}")
+  fi
+done
+
+case "${NETWORK_MODE}" in
+  firewall)
+    DOCKER_NETWORK_ARGS+=(--cap-drop=ALL --cap-add=NET_ADMIN --cap-add=SETUID --cap-add=SETGID)
+    ;;
+  direct)
+    DOCKER_NETWORK_ARGS+=(--cap-drop=ALL)
+    ;;
+  none)
+    DOCKER_NETWORK_ARGS+=(--cap-drop=ALL --network none)
+    ;;
+  *)
+    echo "unsupported CODEX_NETWORK_MODE: ${NETWORK_MODE}" >&2
+    echo "supported values: firewall, direct, none" >&2
+    exit 1
+    ;;
+esac
+
+case "${ROOTFS_MODE}" in
+  writable)
+    ;;
+  readonly)
+    DOCKER_ROOTFS_ARGS+=(
+      --read-only
+      --tmpfs /tmp:rw,noexec,nosuid,nodev
+      --tmpfs /var/tmp:rw,noexec,nosuid,nodev
+      --tmpfs /run:rw,nosuid,nodev
+      --tmpfs /home/dev/.cache:rw,nosuid,nodev
+    )
+    ;;
+  *)
+    echo "unsupported CODEX_ROOTFS_MODE: ${ROOTFS_MODE}" >&2
+    echo "supported values: writable, readonly" >&2
+    exit 1
+    ;;
+esac
+
+exec docker run \
+  --interactive --tty --rm \
+  --user "$(id -u):$(id -g)" \
+  --security-opt no-new-privileges:true \
+  ${DOCKER_PUBLISH_ARGS[@]+"${DOCKER_PUBLISH_ARGS[@]}"} \
+  ${DOCKER_NETWORK_ARGS[@]+"${DOCKER_NETWORK_ARGS[@]}"} \
+  ${DOCKER_ROOTFS_ARGS[@]+"${DOCKER_ROOTFS_ARGS[@]}"} \
+  ${DOCKER_ENV_ARGS[@]+"${DOCKER_ENV_ARGS[@]}"} \
+  ${DOCKER_MOUNT_ARGS[@]+"${DOCKER_MOUNT_ARGS[@]}"} \
+  --workdir "${WORKSPACE_IN_CONTAINER}" \
+  "${IMAGE}" \
+  "$@"
