@@ -60,6 +60,7 @@ RUN if [ -d /root/.nvm ]; then mv /root/.nvm "${RUNTIME_ROOT}/nvm"; ln -s "${RUN
  && bash -lc 'source /root/.nvm/nvm.sh && DEFAULT_NODE_BIN="$(dirname "$(nvm which default)")" && for tool in node npm npx corepack; do ln -sf "$DEFAULT_NODE_BIN/$tool" "/usr/local/bin/$tool"; done' \
  && npm install -g @openai/codex \
  && ln -sf "$(npm prefix -g)/bin/codex" /usr/local/bin/codex \
+ && mv /usr/local/bin/codex /usr/local/bin/codex-real \
  && for tool in pnpm yarn bun cargo rustc rustup ruby gem bundle java javac gradle mvn elixir erl iex php composer; do \
       if [ -x "${RUNTIME_ROOT}/cargo/bin/$tool" ]; then ln -sf "${RUNTIME_ROOT}/cargo/bin/$tool" "/usr/local/bin/$tool"; fi; \
       if [ -x "${RUNTIME_ROOT}/phpenv/shims/$tool" ]; then ln -sf "${RUNTIME_ROOT}/phpenv/shims/$tool" "/usr/local/bin/$tool"; fi; \
@@ -67,8 +68,9 @@ RUN if [ -d /root/.nvm ]; then mv /root/.nvm "${RUNTIME_ROOT}/nvm"; ln -s "${RUN
     done
 
 COPY allowed-domains.txt /etc/codex-allowed-domains.txt
+COPY codex-wrapper.sh /usr/local/bin/codex
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-RUN chmod +x /usr/local/bin/init-firewall.sh \
+RUN chmod +x /usr/local/bin/codex /usr/local/bin/init-firewall.sh \
  && printf 'Defaults!/usr/local/bin/init-firewall.sh !pam_acct_mgmt\nALL ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh\n' \
       > /etc/sudoers.d/codex-firewall \
  && chmod 0440 /etc/sudoers.d/codex-firewall

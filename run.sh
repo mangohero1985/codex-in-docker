@@ -26,6 +26,10 @@ ALLOWED_PASSTHROUGH_ENVS=(
   CODEX_API_KEY
   CODEX_CA_CERTIFICATE
 )
+PROJECT_ENV_FILE_NAME=".codex.env"
+PROJECT_ALLOWED_ENV_KEYS=(
+  OPENAI_API_KEY
+)
 HOST_CODEX_DIR="${HOME}/.codex"
 HOST_CODEX_IMPORT_ITEMS=(
   config.toml
@@ -109,6 +113,57 @@ warn_ignored_sensitive_host_envs() {
   fi
 }
 
+load_project_env_file() {
+  local env_file="${PROJECT_DIR}/${PROJECT_ENV_FILE_NAME}"
+  local line
+  local key
+  local value
+  local allowed=false
+
+  [[ -f "${env_file}" ]] || return 0
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      continue
+    fi
+
+    if [[ "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      echo "[env] unsupported line in ${env_file}: ${line}" >&2
+      exit 1
+    fi
+
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    allowed=false
+
+    for allowed_key in "${PROJECT_ALLOWED_ENV_KEYS[@]}"; do
+      if [[ "${key}" == "${allowed_key}" ]]; then
+        allowed=true
+        break
+      fi
+    done
+
+    if [[ "${allowed}" != true ]]; then
+      echo "[env] unsupported key in ${env_file}: ${key}" >&2
+      exit 1
+    fi
+
+    if [[ "${value}" =~ ^\"(.*)\"$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    elif [[ "${value}" =~ ^\'(.*)\'$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    fi
+
+    DOCKER_ENV_ARGS+=(--env "${key}=${value}")
+  done < "${env_file}"
+}
+
 prepare_host_codex_seed_dir() {
   local seed_dir="${RUNTIME_STATE_DIR}/host-codex-seed"
   local item
@@ -125,37 +180,80 @@ prepare_host_codex_seed_dir() {
   done
 }
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+compute_seed_dir_hash() {
+  local seed_dir="$1"
+
+  (
+    cd "${seed_dir}"
+    while IFS= read -r path; do
+      if [[ -d "${path}" ]]; then
+        printf 'dir\t%s\n' "${path}"
+      elif [[ -f "${path}" ]]; then
+        printf 'file\t%s\t%s\n' "${path}" "$(sha256_file "${path}")"
+      elif [[ -L "${path}" ]]; then
+        printf 'symlink\t%s\t%s\n' "${path}" "$(readlink "${path}")"
+      fi
+    done < <(find . -mindepth 1 -print | LC_ALL=C sort)
+  ) | sha256_stdin
+}
+
 seed_codex_home_volume_if_needed() {
   local seed_dir="${RUNTIME_STATE_DIR}/host-codex-seed"
   local first_seed_entry
+  local seed_hash
 
   [[ -d "${seed_dir}" ]] || return 0
   first_seed_entry="$(find "${seed_dir}" -mindepth 1 -print -quit)"
   [[ -n "${first_seed_entry}" ]] || return 0
+  seed_hash="$(compute_seed_dir_hash "${seed_dir}")"
 
   docker run --rm \
     --entrypoint bash \
     --env "HOST_UID=${HOST_UID}" \
     --env "HOST_GID=${HOST_GID}" \
+    --env "HOST_CODEX_SEED_HASH=${seed_hash}" \
     --volume "${CODEX_HOME_VOLUME}:${CODEX_HOME_IN_CONTAINER}" \
     --volume "${seed_dir}:/seed:ro" \
     "${IMAGE}" \
     -lc '
       set -euo pipefail
-      marker="'"${CODEX_HOME_IN_CONTAINER}"'/.host-config-imported"
+      marker="'"${CODEX_HOME_IN_CONTAINER}"'/.host-config-imported.sha256"
+      current_hash=""
 
       if [[ -e "$marker" ]]; then
+        current_hash="$(cat "$marker")"
+      fi
+
+      if [[ "$current_hash" == "$HOST_CODEX_SEED_HASH" ]]; then
         exit 0
       fi
 
       mkdir -p "'"${CODEX_HOME_IN_CONTAINER}"'"
+      for base in config.toml prompts rules skills; do
+        rm -rf "'"${CODEX_HOME_IN_CONTAINER}"'/$base"
+      done
       shopt -s dotglob nullglob
       for item in /seed/*; do
         base="$(basename "$item")"
-        rm -rf "'"${CODEX_HOME_IN_CONTAINER}"'/$base"
         cp -R "$item" "'"${CODEX_HOME_IN_CONTAINER}"'/$base"
       done
-      date -u +"%Y-%m-%dT%H:%M:%SZ" > "$marker"
+      printf "%s\n" "$HOST_CODEX_SEED_HASH" > "$marker"
       chown -R "${HOST_UID}:${HOST_GID}" "'"${CODEX_HOME_IN_CONTAINER}"'"
       chmod 700 "'"${CODEX_HOME_IN_CONTAINER}"'"
       find "'"${CODEX_HOME_IN_CONTAINER}"'" -type d -exec chmod 755 {} \;
@@ -164,12 +262,13 @@ seed_codex_home_volume_if_needed() {
       chmod 600 "'"${CODEX_HOME_IN_CONTAINER}"'/config.toml 2>/dev/null || true
     '
 
-  echo ">> imported host Codex config into volume: ${CODEX_HOME_VOLUME}"
+  echo ">> synchronized host Codex config into volume: ${CODEX_HOME_VOLUME}"
 }
 
 context_hash() {
   local files=(
     "${SCRIPT_DIR}/Dockerfile"
+    "${SCRIPT_DIR}/codex-wrapper.sh"
     "${SCRIPT_DIR}/entrypoint.sh"
     "${SCRIPT_DIR}/init-firewall.sh"
     "${SCRIPT_DIR}/allowed-domains.txt"
@@ -267,6 +366,7 @@ if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
   exit 0
 fi
 
+load_project_env_file
 prepare_host_codex_seed_dir
 seed_codex_home_volume_if_needed
 

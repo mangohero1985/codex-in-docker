@@ -53,6 +53,18 @@ or:
 codex exec "your task here"
 ```
 
+By default, the container-side `codex` wrapper disables the inner Codex `bwrap`
+sandbox and runs with `--sandbox danger-full-access`. This keeps Docker as the
+main isolation boundary and avoids nested sandbox failures such as
+`bwrap: No permissions to create a new namespace...`.
+
+To restore the original Codex sandbox behavior for a single container session:
+
+```bash
+CODEX_DISABLE_INNER_SANDBOX=0 bash
+codex
+```
+
 ## Login
 
 In an online session:
@@ -80,7 +92,7 @@ That volume stores:
 
 ## Host Config Import
 
-On first use of a project volume, the launcher imports these host-side Codex assets from `~/.codex`:
+On startup, the launcher syncs these host-side Codex assets from `~/.codex` into the project volume whenever their content changes:
 
 - `config.toml`
 - `prompts/`
@@ -98,6 +110,21 @@ The launcher only forwards these auth-related env vars:
 - `CODEX_CA_CERTIFICATE`
 
 Common host secret env vars are not forwarded.
+
+For project-local secrets, you can create `./.codex.env`. The launcher reads
+this file on startup and forwards only the explicitly allowed keys below:
+
+- `OPENAI_API_KEY`
+
+Example:
+
+```bash
+cat > .codex.env <<'EOF'
+OPENAI_API_KEY=your-litellm-key
+EOF
+```
+
+`/.codex.env` is intended to stay local to your machine and should be ignored by Git.
 
 ## Guardrails
 
