@@ -164,3 +164,11 @@ Known limitation:
 - real Codex development: `direct + writable`
 - do not mount host secret directories
 - do not rely on general host secret env vars inside the container
+
+## Acknowledgements
+
+This project was put together with reference to these two projects. Thanks to
+their authors for the ideas and groundwork:
+
+- `openai/codex-universal`: `https://github.com/openai/codex-universal`
+- `MrOggy85/claude-in-docker`: `https://github.com/MrOggy85/claude-in-docker`
