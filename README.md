@@ -2,6 +2,19 @@
 
 Run Codex inside Docker instead of directly on the host.
 
+## Quick Setup
+
+Before starting an online session, create `./.codex.env` in your project root:
+
+```bash
+cat > .codex.env <<'EOF'
+OPENAI_API_KEY=your-openai-key
+EOF
+```
+
+The launcher reads this file on startup and forwards only explicitly allowed
+keys such as `OPENAI_API_KEY`.
+
 ## What It Does
 
 - runs Codex in a dedicated container
@@ -115,14 +128,6 @@ For project-local secrets, you can create `./.codex.env`. The launcher reads
 this file on startup and forwards only the explicitly allowed keys below:
 
 - `OPENAI_API_KEY`
-
-Example:
-
-```bash
-cat > .codex.env <<'EOF'
-OPENAI_API_KEY=your-litellm-key
-EOF
-```
 
 `/.codex.env` is intended to stay local to your machine and should be ignored by Git.
 
