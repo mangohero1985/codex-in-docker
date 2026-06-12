@@ -27,6 +27,7 @@ ALLOWED_PASSTHROUGH_ENVS=(
   CODEX_CA_CERTIFICATE
 )
 PROJECT_ENV_FILE_NAME=".codex.env"
+GLOBAL_ENV_FILE="${SCRIPT_DIR}/.codex.env"
 PROJECT_ALLOWED_ENV_KEYS=(
   OPENAI_API_KEY
 )
@@ -113,8 +114,8 @@ warn_ignored_sensitive_host_envs() {
   fi
 }
 
-load_project_env_file() {
-  local env_file="${PROJECT_DIR}/${PROJECT_ENV_FILE_NAME}"
+load_env_file() {
+  local env_file="$1"
   local line
   local key
   local value
@@ -162,6 +163,14 @@ load_project_env_file() {
 
     DOCKER_ENV_ARGS+=(--env "${key}=${value}")
   done < "${env_file}"
+}
+
+load_project_env_file() {
+  load_env_file "${PROJECT_DIR}/${PROJECT_ENV_FILE_NAME}"
+}
+
+load_global_env_file() {
+  load_env_file "${GLOBAL_ENV_FILE}"
 }
 
 prepare_host_codex_seed_dir() {
@@ -366,6 +375,7 @@ if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
   exit 0
 fi
 
+load_global_env_file
 load_project_env_file
 prepare_host_codex_seed_dir
 seed_codex_home_volume_if_needed

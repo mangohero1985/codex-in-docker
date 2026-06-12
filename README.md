@@ -4,16 +4,18 @@ Run Codex inside Docker instead of directly on the host.
 
 ## Quick Setup
 
-Before starting an online session, create `./.codex.env` in your project root:
+Before starting an online session, you can create a global `.codex.env` next to
+`run.sh`:
 
 ```bash
-cat > .codex.env <<'EOF'
+cat > /path/to/codex-in-docker/.codex.env <<'EOF'
 OPENAI_API_KEY=your-openai-key
 EOF
 ```
 
-The launcher reads this file on startup and forwards only explicitly allowed
-keys such as `OPENAI_API_KEY`.
+You can also create `./.codex.env` in an individual project. The launcher loads
+the global file first and then the project file, so project-local values
+override the global defaults.
 
 ## What It Does
 
@@ -124,12 +126,19 @@ The launcher only forwards these auth-related env vars:
 
 Common host secret env vars are not forwarded.
 
-For project-local secrets, you can create `./.codex.env`. The launcher reads
-this file on startup and forwards only the explicitly allowed keys below:
+For local secrets, the launcher reads these files on startup in this order:
+
+- `/path/to/codex-in-docker/.codex.env`
+- `./.codex.env`
+
+If the same key appears in both files, the project-local `./.codex.env`
+overrides the global value. Only the explicitly allowed keys below are
+forwarded:
 
 - `OPENAI_API_KEY`
 
-`/.codex.env` is intended to stay local to your machine and should be ignored by Git.
+Both `.codex.env` files are intended to stay local to your machine and should be
+ignored by Git.
 
 ## Guardrails
 
