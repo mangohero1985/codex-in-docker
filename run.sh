@@ -12,7 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd -P)"
 NETWORK_MODE="${CODEX_NETWORK_MODE:-none}"
 ROOTFS_MODE="${CODEX_ROOTFS_MODE:-readonly}"
+DEPENDENCY_ISOLATION_MODE="${CODEX_DEPENDENCY_ISOLATION:-enabled}"
 MCP_OAUTH_CALLBACK_PORT="${CODEX_MCP_OAUTH_CALLBACK_PORT:-}"
+CONTAINER_NAME_OVERRIDE="${CODEX_CONTAINER_NAME:-}"
 RUNTIME_STATE_DIR="${SCRIPT_DIR}/.tmp/runtime"
 PASSWD_FILE="${RUNTIME_STATE_DIR}/passwd"
 GROUP_FILE="${RUNTIME_STATE_DIR}/group"
@@ -20,11 +22,13 @@ PROJECT_HASH_INPUT="${PROJECT_DIR}"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 PRINT_CODEX_HOME_VOLUME=false
+MANAGEMENT_ACTION=""
 DOCKER_COMMAND_ARGS=()
 EXTRA_MOUNT_MODES=()
 EXTRA_MOUNT_NAMES=()
 EXTRA_MOUNT_DIRS=()
 EXTRA_MOUNT_TARGETS=()
+UNIQUE_VALUES=()
 ALLOWED_PASSTHROUGH_ENVS=(
   CODEX_ACCESS_TOKEN
   CODEX_API_KEY
@@ -41,6 +45,16 @@ HOST_CODEX_IMPORT_ITEMS=(
   prompts
   rules
   skills
+)
+DEPENDENCY_ISOLATED_DIRS=(
+  node_modules
+  .pnpm-store
+  .yarn
+  .venv
+  venv
+  env
+  .tox
+  .nox
 )
 SENSITIVE_HOST_PATHS=(
   "${HOME}/.ssh"
@@ -119,6 +133,14 @@ path_hash() {
   fi
 }
 
+init_project_identity() {
+  PROJECT_HASH_SHORT="$(path_hash "${PROJECT_HASH_INPUT}")"
+  SAFE_NAME="$(printf '%s' "$(basename "${PROJECT_DIR}")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
+  SAFE_NAME="$(printf '%s' "${SAFE_NAME}" | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+  CODEX_HOME_VOLUME="${CODEX_HOME_VOLUME:-codex-home-${SAFE_NAME:-repo}-${PROJECT_HASH_SHORT}}"
+  CONTAINER_NAME="${CONTAINER_NAME_OVERRIDE:-codex-${SAFE_NAME:-repo}-${PROJECT_HASH_SHORT}-$$}"
+}
+
 register_extra_mount() {
   local mode="$1"
   local spec="$2"
@@ -168,11 +190,126 @@ register_extra_mount() {
   EXTRA_MOUNT_TARGETS+=("${target_path}")
 }
 
+dependency_volume_name() {
+  local identity="$1"
+  local rel_dir="$2"
+  local safe_rel
+
+  safe_rel="$(printf '%s' "${rel_dir}" | tr '/.' '--' | tr -c 'a-zA-Z0-9_-' '-')"
+  safe_rel="$(printf '%s' "${safe_rel}" | tr '[:upper:]' '[:lower:]' | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+  printf 'codex-deps-%s-%s' "$(path_hash "${identity}")" "${safe_rel:-dir}"
+}
+
+register_dependency_mounts() {
+  local identity="$1"
+  local container_base="$2"
+  local rel_dir
+  local volume_name
+
+  for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
+    volume_name="$(dependency_volume_name "${identity}:${rel_dir}" "${rel_dir}")"
+    DOCKER_MOUNT_ARGS+=(--volume "${volume_name}:${container_base}/${rel_dir}")
+  done
+}
+
+append_unique_value() {
+  local value="$1"
+  local existing
+
+  for existing in "${UNIQUE_VALUES[@]:-}"; do
+    if [[ "${existing}" == "${value}" ]]; then
+      return 0
+    fi
+  done
+
+  UNIQUE_VALUES+=("${value}")
+}
+
+collect_project_volume_names() {
+  local roots=("${PROJECT_DIR}")
+  local root
+  local rel_dir
+
+  for root in "${EXTRA_MOUNT_DIRS[@]}"; do
+    roots+=("${root}")
+  done
+
+  UNIQUE_VALUES=()
+  append_unique_value "${CODEX_HOME_VOLUME}"
+
+  if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
+    for root in "${roots[@]}"; do
+      for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
+        append_unique_value "$(dependency_volume_name "${root}:${rel_dir}" "${rel_dir}")"
+      done
+    done
+  fi
+
+  printf '%s\n' "${UNIQUE_VALUES[@]}"
+}
+
+list_codex_volumes() {
+  docker volume ls --format '{{.Name}}' | grep -E '^codex-(home|deps)-' || true
+}
+
+remove_named_volumes() {
+  local volume
+  local removed_any=false
+
+  while IFS= read -r volume; do
+    [[ -n "${volume}" ]] || continue
+    if docker volume inspect "${volume}" >/dev/null 2>&1; then
+      echo "removing volume: ${volume}"
+      docker volume rm "${volume}"
+      removed_any=true
+    fi
+  done
+
+  if [[ "${removed_any}" != true ]]; then
+    echo "no matching codex volumes found"
+  fi
+}
+
+run_management_action() {
+  case "${MANAGEMENT_ACTION}" in
+    list-volumes)
+      list_codex_volumes
+      ;;
+    prune-project-volumes)
+      collect_project_volume_names | remove_named_volumes
+      ;;
+    prune-all-volumes)
+      list_codex_volumes | remove_named_volumes
+      ;;
+    "")
+      return 0
+      ;;
+    *)
+      echo "unsupported management action: ${MANAGEMENT_ACTION}" >&2
+      exit 1
+      ;;
+  esac
+
+  exit 0
+}
+
 parse_launcher_args() {
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --print-codex-home-volume)
         PRINT_CODEX_HOME_VOLUME=true
+        shift
+        ;;
+      --list-volumes)
+        MANAGEMENT_ACTION="list-volumes"
+        shift
+        ;;
+      --prune-project-volumes)
+        MANAGEMENT_ACTION="prune-project-volumes"
+        shift
+        ;;
+      --prune-all-volumes)
+        MANAGEMENT_ACTION="prune-all-volumes"
         shift
         ;;
       --mount)
@@ -218,6 +355,8 @@ if [[ "${#DOCKER_COMMAND_ARGS[@]}" -gt 0 ]]; then
 else
   set --
 fi
+
+init_project_identity
 
 warn_ignored_sensitive_host_envs() {
   local env_name
@@ -418,6 +557,20 @@ context_hash() {
   fi | sha256sum | cut -c1-16
 }
 
+case "${DEPENDENCY_ISOLATION_MODE}" in
+  enabled|disabled)
+    ;;
+  *)
+    echo "unsupported CODEX_DEPENDENCY_ISOLATION: ${DEPENDENCY_ISOLATION_MODE}" >&2
+    echo "supported values: enabled, disabled" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "${MANAGEMENT_ACTION}" ]]; then
+  run_management_action
+fi
+
 CURRENT_HASH="$(context_hash)"
 IMAGE_HASH="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "build.context-hash"}}' 2>/dev/null || true)"
 
@@ -467,6 +620,7 @@ DOCKER_MOUNT_ARGS=(
   --volume "${GROUP_FILE}:/etc/group:ro"
 )
 DOCKER_ROOTFS_ARGS=()
+DOCKER_CONTAINER_ARGS=()
 
 if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
   if [[ ! "${MCP_OAUTH_CALLBACK_PORT}" =~ ^[0-9]+$ ]]; then
@@ -481,16 +635,25 @@ if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
   DOCKER_PUBLISH_ARGS+=(--publish "127.0.0.1:${MCP_OAUTH_CALLBACK_PORT}:${MCP_OAUTH_CALLBACK_PORT}")
 fi
 
-SAFE_NAME="$(printf '%s' "$(basename "${PROJECT_DIR}")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
-SAFE_NAME="$(printf '%s' "${SAFE_NAME}" | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
-CODEX_HOME_VOLUME="${CODEX_HOME_VOLUME:-codex-home-${SAFE_NAME:-repo}-$(path_hash "${PROJECT_HASH_INPUT}")}"
 DOCKER_MOUNT_ARGS+=(--volume "${CODEX_HOME_VOLUME}:${CODEX_HOME_IN_CONTAINER}")
+DOCKER_CONTAINER_ARGS+=(
+  --name "${CONTAINER_NAME}"
+  --label "codex.project_dir=${PROJECT_DIR}"
+  --label "codex.project_hash=${PROJECT_HASH_SHORT}"
+)
+
+if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
+  register_dependency_mounts "${PROJECT_DIR}" "${WORKSPACE_IN_CONTAINER}"
+fi
 
 for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
   mount_dir="${EXTRA_MOUNT_DIRS[i]}"
   target_path="${EXTRA_MOUNT_TARGETS[i]}"
   mount_mode="${EXTRA_MOUNT_MODES[i]}"
   DOCKER_MOUNT_ARGS+=(--volume "${mount_dir}:${target_path}:${mount_mode}")
+  if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
+    register_dependency_mounts "${mount_dir}" "${target_path}"
+  fi
 done
 
 if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
@@ -506,7 +669,12 @@ seed_codex_home_volume_if_needed
 echo ">> project: ${PROJECT_DIR}"
 echo ">> workspace root: ${WORKSPACE_ROOT_IN_CONTAINER}"
 echo ">> primary mount: ${PROJECT_DIR} -> ${WORKSPACE_IN_CONTAINER}"
+echo ">> container name: ${CONTAINER_NAME}"
 echo ">> codex home volume: ${CODEX_HOME_VOLUME}"
+echo ">> dependency isolation: ${DEPENDENCY_ISOLATION_MODE}"
+if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
+  echo ">> isolated dependency dirs: ${DEPENDENCY_ISOLATED_DIRS[*]}"
+fi
 for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
   mount_dir="${EXTRA_MOUNT_DIRS[i]}"
   target_path="${EXTRA_MOUNT_TARGETS[i]}"
@@ -563,6 +731,7 @@ exec docker run \
   --interactive --tty --rm \
   --user "$(id -u):$(id -g)" \
   --security-opt no-new-privileges:true \
+  ${DOCKER_CONTAINER_ARGS[@]+"${DOCKER_CONTAINER_ARGS[@]}"} \
   ${DOCKER_PUBLISH_ARGS[@]+"${DOCKER_PUBLISH_ARGS[@]}"} \
   ${DOCKER_NETWORK_ARGS[@]+"${DOCKER_NETWORK_ARGS[@]}"} \
   ${DOCKER_ROOTFS_ARGS[@]+"${DOCKER_ROOTFS_ARGS[@]}"} \
