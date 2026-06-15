@@ -2,6 +2,93 @@
 
 Run Codex inside Docker instead of directly on the host.
 
+## Quick Start
+
+Default safe mode:
+
+```bash
+cd /path/to/your/project
+mkdir -p /path/to/codex-in-docker/.tmp/buildx
+BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
+bash /path/to/codex-in-docker/run.sh
+```
+
+Online writable mode:
+
+```bash
+cd /path/to/your/project
+mkdir -p /path/to/codex-in-docker/.tmp/buildx
+BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
+CODEX_NETWORK_MODE=direct \
+CODEX_ROOTFS_MODE=writable \
+bash /path/to/codex-in-docker/run.sh
+```
+
+Online mode with extra mounts:
+
+```bash
+cd /path/to/primary-project
+mkdir -p /path/to/codex-in-docker/.tmp/buildx
+BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
+CODEX_NETWORK_MODE=direct \
+CODEX_ROOTFS_MODE=writable \
+bash /path/to/codex-in-docker/run.sh \
+  --mount /path/to/service-a \
+  --mount /path/to/service-b:backend \
+  --mount-ro /path/to/shared-specs:specs
+```
+
+Volume management:
+
+```bash
+bash /path/to/codex-in-docker/run.sh --list-volumes
+bash /path/to/codex-in-docker/run.sh --prune-project-volumes
+bash /path/to/codex-in-docker/run.sh --prune-all-volumes
+```
+
+After the container starts:
+
+```bash
+codex
+```
+
+or:
+
+```bash
+codex exec "your task here"
+```
+
+## Parameter List
+
+Launcher flags:
+
+- `--mount /path/to/repo`
+- `--mount /path/to/repo:alias`
+- `--mount-ro /path/to/repo`
+- `--mount-ro /path/to/repo:alias`
+- `--print-codex-home-volume`
+- `--list-volumes`
+- `--prune-project-volumes`
+- `--prune-all-volumes`
+- `--`
+
+Important environment variables:
+
+- `CODEX_NETWORK_MODE=none|firewall|direct`
+- `CODEX_ROOTFS_MODE=readonly|writable`
+- `CODEX_DEPENDENCY_ISOLATION=enabled|disabled`
+- `CODEX_CONTAINER_NAME=<name>`
+- `CODEX_MCP_OAUTH_CALLBACK_PORT=<port>`
+- `CODEX_HOME_VOLUME=<docker-volume-name>`
+
+Semantics:
+
+- `--mount` adds an extra read-write bind mount under `/home/dev/workspace/_mounts/<name>`
+- `--mount-ro` adds an extra read-only bind mount
+- `--` stops launcher flag parsing and passes the remaining args to the container command
+- `--prune-project-volumes` removes the current project's `codex-home-*` volume and, when enabled, its dependency isolation volumes
+- `--prune-all-volumes` removes every `codex-home-*` and `codex-deps-*` volume on the Docker host
+
 ## Quick Setup
 
 Before starting an online session, you can create a global `.codex.env` next to
@@ -22,52 +109,11 @@ override the global defaults.
 - runs Codex in a dedicated container
 - mounts the current project directory at `/home/dev/workspace/current`
 - optionally mounts additional host folders under `/home/dev/workspace/_mounts/<name>`
+- keeps common Node/Python dependency directories in container-only Docker volumes by default
 - stores Codex state in a project-scoped Docker volume at `/home/dev/.codex`
+- uses explicit Docker names for the Codex container and its volumes
 - blocks obvious host secret paths and does not forward common secret env vars
 - defaults to an offline, read-only container
-
-## Default Start
-
-This is the launcher default:
-
-- `CODEX_NETWORK_MODE=none`
-- `CODEX_ROOTFS_MODE=readonly`
-
-Use it like this:
-
-```bash
-cd /path/to/your/project
-mkdir -p /path/to/codex-in-docker/.tmp/buildx
-BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
-bash /path/to/codex-in-docker/run.sh
-```
-
-This mode is safe by default, but it cannot call the Codex model.
-
-## Online Start
-
-Use this when you want real Codex model access:
-
-```bash
-cd /path/to/your/project
-mkdir -p /path/to/codex-in-docker/.tmp/buildx
-BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
-CODEX_NETWORK_MODE=direct \
-CODEX_ROOTFS_MODE=writable \
-bash /path/to/codex-in-docker/run.sh
-```
-
-Inside the container:
-
-```bash
-codex
-```
-
-or:
-
-```bash
-codex exec "your task here"
-```
 
 ## Extra Project Mounts
 
@@ -99,6 +145,47 @@ Notes:
 - if you need to pass `--mount` to the command inside the container, separate
   launcher args from command args with `--`
 
+## Dependency Isolation
+
+By default, the launcher keeps common dependency install directories in
+container-only Docker volumes instead of writing them back into the host
+checkout.
+
+Current isolated directories:
+
+- `node_modules`
+- `.pnpm-store`
+- `.yarn`
+- `.venv`
+- `venv`
+- `env`
+- `.tox`
+- `.nox`
+
+This applies to both the primary project and extra mounts.
+
+Example:
+
+- `npm install` writes package contents into the container volume mounted at
+  `/home/dev/workspace/current/node_modules`
+- `python -m venv .venv` writes the environment into the container volume
+  mounted at `/home/dev/workspace/current/.venv`
+
+Important limits:
+
+- dependency manifests such as `package.json`, lockfiles, `requirements.txt`,
+  `pyproject.toml`, or `.pnp.cjs` still live in the host checkout and can still
+  be modified
+- custom install targets outside the isolated directory list are not captured
+- if you disable this feature, dependency directories go back to the host bind
+  mount behavior
+
+To turn dependency isolation off for a session:
+
+```bash
+CODEX_DEPENDENCY_ISOLATION=disabled bash /path/to/codex-in-docker/run.sh
+```
+
 By default, the container-side `codex` wrapper disables the inner Codex `bwrap`
 sandbox and runs with `--sandbox danger-full-access`. This keeps Docker as the
 main isolation boundary and avoids nested sandbox failures such as
@@ -129,7 +216,9 @@ The launcher prints the current project and Codex state volume:
 >> project: ...
 >> workspace root: /home/dev/workspace
 >> primary mount: ... -> /home/dev/workspace/current
+>> container name: codex-...
 >> codex home volume: ...
+>> dependency isolation: enabled
 ```
 
 That volume stores:
@@ -137,6 +226,15 @@ That volume stores:
 - Codex login state
 - Codex sessions
 - Docker-side config
+
+Naming notes:
+
+- the Codex home volume uses a stable name like `codex-home-<project>-<hash>`
+- dependency isolation volumes use stable names like `codex-deps-<hash>-node_modules`
+- the running container gets an explicit name like
+  `codex-<project>-<hash>-<pid>`
+- you can override the container name for one launch with
+  `CODEX_CONTAINER_NAME=my-codex-session`
 
 ## Host Config Import
 
@@ -209,6 +307,7 @@ Known limitation:
 - real Codex development: `direct + writable`
 - mount extra repos only when they are needed for the task
 - prefer `--mount-ro` for reference code or docs you do not need to edit
+- leave dependency isolation enabled unless you explicitly need host-side installs
 - do not mount host secret directories
 - do not rely on general host secret env vars inside the container
 
@@ -226,6 +325,8 @@ What does change is host filesystem exposure:
 - read-write mounts allow edits to those host files from inside the container
 - Docker `--read-only` does not make bind mounts read-only; use `--mount-ro` if
   you want that behavior
+- dependency isolation reduces write-back for common install directories, but it
+  does not stop changes to manifest or source files in the mounted checkout
 
 ## Acknowledgements
 
