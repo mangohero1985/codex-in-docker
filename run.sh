@@ -4,7 +4,9 @@ set -euo pipefail
 
 IMAGE="codex-in-docker:local"
 HOME_IN_CONTAINER="/home/dev"
-WORKSPACE_IN_CONTAINER="${HOME_IN_CONTAINER}/workspace"
+WORKSPACE_ROOT_IN_CONTAINER="${HOME_IN_CONTAINER}/workspace"
+WORKSPACE_IN_CONTAINER="${WORKSPACE_ROOT_IN_CONTAINER}/current"
+EXTRA_WORKSPACES_IN_CONTAINER="${WORKSPACE_ROOT_IN_CONTAINER}/_mounts"
 CODEX_HOME_IN_CONTAINER="${HOME_IN_CONTAINER}/.codex"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd -P)"
@@ -18,9 +20,11 @@ PROJECT_HASH_INPUT="${PROJECT_DIR}"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 PRINT_CODEX_HOME_VOLUME=false
-if [[ "${1:-}" == "--print-codex-home-volume" ]]; then
-  PRINT_CODEX_HOME_VOLUME=true
-fi
+DOCKER_COMMAND_ARGS=()
+EXTRA_MOUNT_MODES=()
+EXTRA_MOUNT_NAMES=()
+EXTRA_MOUNT_DIRS=()
+EXTRA_MOUNT_TARGETS=()
 ALLOWED_PASSTHROUGH_ENVS=(
   CODEX_ACCESS_TOKEN
   CODEX_API_KEY
@@ -75,8 +79,8 @@ canonicalize_dir() {
   (cd "${path}" && pwd -P)
 }
 
-assert_safe_project_dir() {
-  local project_dir="$1"
+assert_safe_mount_dir() {
+  local mount_dir="$1"
   local sensitive
   local resolved_sensitive
 
@@ -85,10 +89,10 @@ assert_safe_project_dir() {
       continue
     fi
 
-    case "${project_dir}" in
+    case "${mount_dir}" in
       "${resolved_sensitive}"|"${resolved_sensitive}"/*)
         cat >&2 <<EOF
-[security] refusing to mount sensitive host path: ${project_dir}
+[security] refusing to mount sensitive host path: ${mount_dir}
 [security] blocked because it is inside: ${resolved_sensitive}
 [security] clone the repository into a dedicated workspace directory and run codex-in-docker from there.
 EOF
@@ -97,6 +101,123 @@ EOF
     esac
   done
 }
+
+sanitize_mount_name() {
+  local raw_name="$1"
+  local safe_name
+
+  safe_name="$(printf '%s' "${raw_name}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-')"
+  safe_name="$(printf '%s' "${safe_name}" | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+  printf '%s' "${safe_name}"
+}
+
+path_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -c1-10
+  else
+    printf '%s' "$1" | shasum -a 256 | cut -c1-10
+  fi
+}
+
+register_extra_mount() {
+  local mode="$1"
+  local spec="$2"
+  local mount_dir=""
+  local requested_name=""
+  local safe_name
+  local target_path
+  local existing_name
+  local i
+
+  if mount_dir="$(canonicalize_dir "${spec}")"; then
+    requested_name="$(basename "${mount_dir}")"
+  elif [[ "${spec}" =~ ^(.+):([A-Za-z0-9._-]+)$ ]] && mount_dir="$(canonicalize_dir "${BASH_REMATCH[1]}")"; then
+    requested_name="${BASH_REMATCH[2]}"
+  else
+    echo "unsupported mount path: ${spec}" >&2
+    echo "expected an existing directory, optionally with :name suffix" >&2
+    exit 1
+  fi
+
+  safe_name="$(sanitize_mount_name "${requested_name}")"
+  if [[ -z "${safe_name}" ]]; then
+    echo "unsupported mount name in spec: ${spec}" >&2
+    exit 1
+  fi
+
+  if [[ "${safe_name}" == "$(basename "${WORKSPACE_IN_CONTAINER}")" ]]; then
+    safe_name="${safe_name}-$(path_hash "${mount_dir}")"
+  fi
+
+  for ((i=0; i<${#EXTRA_MOUNT_NAMES[@]}; i++)); do
+    existing_name="${EXTRA_MOUNT_NAMES[i]}"
+    if [[ "${mount_dir}" == "${EXTRA_MOUNT_DIRS[i]}" ]]; then
+      echo "duplicate mount path requested: ${mount_dir}" >&2
+      exit 1
+    fi
+    if [[ "${safe_name}" == "${existing_name}" ]]; then
+      safe_name="${safe_name}-$(path_hash "${mount_dir}")"
+      break
+    fi
+  done
+
+  target_path="${EXTRA_WORKSPACES_IN_CONTAINER}/${safe_name}"
+  EXTRA_MOUNT_MODES+=("${mode}")
+  EXTRA_MOUNT_NAMES+=("${safe_name}")
+  EXTRA_MOUNT_DIRS+=("${mount_dir}")
+  EXTRA_MOUNT_TARGETS+=("${target_path}")
+}
+
+parse_launcher_args() {
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --print-codex-home-volume)
+        PRINT_CODEX_HOME_VOLUME=true
+        shift
+        ;;
+      --mount)
+        [[ "$#" -ge 2 ]] || {
+          echo "--mount requires a path argument" >&2
+          exit 1
+        }
+        register_extra_mount "rw" "$2"
+        shift 2
+        ;;
+      --mount=*)
+        register_extra_mount "rw" "${1#--mount=}"
+        shift
+        ;;
+      --mount-ro)
+        [[ "$#" -ge 2 ]] || {
+          echo "--mount-ro requires a path argument" >&2
+          exit 1
+        }
+        register_extra_mount "ro" "$2"
+        shift 2
+        ;;
+      --mount-ro=*)
+        register_extra_mount "ro" "${1#--mount-ro=}"
+        shift
+        ;;
+      --)
+        shift
+        DOCKER_COMMAND_ARGS+=("$@")
+        break
+        ;;
+      *)
+        DOCKER_COMMAND_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+parse_launcher_args "$@"
+if [[ "${#DOCKER_COMMAND_ARGS[@]}" -gt 0 ]]; then
+  set -- "${DOCKER_COMMAND_ARGS[@]}"
+else
+  set --
+fi
 
 warn_ignored_sensitive_host_envs() {
   local env_name
@@ -301,7 +422,10 @@ CURRENT_HASH="$(context_hash)"
 IMAGE_HASH="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "build.context-hash"}}' 2>/dev/null || true)"
 
 if [[ "${PRINT_CODEX_HOME_VOLUME}" != true ]]; then
-  assert_safe_project_dir "${PROJECT_DIR}"
+  assert_safe_mount_dir "${PROJECT_DIR}"
+  for mount_dir in "${EXTRA_MOUNT_DIRS[@]}"; do
+    assert_safe_mount_dir "${mount_dir}"
+  done
   warn_ignored_sensitive_host_envs
 fi
 
@@ -357,18 +481,17 @@ if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
   DOCKER_PUBLISH_ARGS+=(--publish "127.0.0.1:${MCP_OAUTH_CALLBACK_PORT}:${MCP_OAUTH_CALLBACK_PORT}")
 fi
 
-path_hash() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | cut -c1-10
-  else
-    printf '%s' "$1" | shasum -a 256 | cut -c1-10
-  fi
-}
-
 SAFE_NAME="$(printf '%s' "$(basename "${PROJECT_DIR}")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
 SAFE_NAME="$(printf '%s' "${SAFE_NAME}" | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
 CODEX_HOME_VOLUME="${CODEX_HOME_VOLUME:-codex-home-${SAFE_NAME:-repo}-$(path_hash "${PROJECT_HASH_INPUT}")}"
 DOCKER_MOUNT_ARGS+=(--volume "${CODEX_HOME_VOLUME}:${CODEX_HOME_IN_CONTAINER}")
+
+for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
+  mount_dir="${EXTRA_MOUNT_DIRS[i]}"
+  target_path="${EXTRA_MOUNT_TARGETS[i]}"
+  mount_mode="${EXTRA_MOUNT_MODES[i]}"
+  DOCKER_MOUNT_ARGS+=(--volume "${mount_dir}:${target_path}:${mount_mode}")
+done
 
 if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
   printf '%s\n' "${CODEX_HOME_VOLUME}"
@@ -381,7 +504,15 @@ prepare_host_codex_seed_dir
 seed_codex_home_volume_if_needed
 
 echo ">> project: ${PROJECT_DIR}"
+echo ">> workspace root: ${WORKSPACE_ROOT_IN_CONTAINER}"
+echo ">> primary mount: ${PROJECT_DIR} -> ${WORKSPACE_IN_CONTAINER}"
 echo ">> codex home volume: ${CODEX_HOME_VOLUME}"
+for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
+  mount_dir="${EXTRA_MOUNT_DIRS[i]}"
+  target_path="${EXTRA_MOUNT_TARGETS[i]}"
+  mount_mode="${EXTRA_MOUNT_MODES[i]}"
+  echo ">> extra mount [${mount_mode}]: ${mount_dir} -> ${target_path}"
+done
 if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
   echo ">> mcp oauth callback port: ${MCP_OAUTH_CALLBACK_PORT}"
 fi

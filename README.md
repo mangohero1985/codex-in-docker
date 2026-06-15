@@ -20,7 +20,8 @@ override the global defaults.
 ## What It Does
 
 - runs Codex in a dedicated container
-- mounts only the current project directory as the workspace
+- mounts the current project directory at `/home/dev/workspace/current`
+- optionally mounts additional host folders under `/home/dev/workspace/_mounts/<name>`
 - stores Codex state in a project-scoped Docker volume at `/home/dev/.codex`
 - blocks obvious host secret paths and does not forward common secret env vars
 - defaults to an offline, read-only container
@@ -68,6 +69,36 @@ or:
 codex exec "your task here"
 ```
 
+## Extra Project Mounts
+
+If you need to work across multiple repositories in one container session, you
+can add extra folder mounts when launching:
+
+```bash
+cd /path/to/primary-project
+mkdir -p /path/to/codex-in-docker/.tmp/buildx
+BUILDX_CONFIG=/path/to/codex-in-docker/.tmp/buildx \
+CODEX_NETWORK_MODE=direct \
+CODEX_ROOTFS_MODE=writable \
+bash /path/to/codex-in-docker/run.sh \
+  --mount /path/to/service-a \
+  --mount /path/to/service-b:backend \
+  --mount-ro /path/to/shared-specs:specs
+```
+
+Inside the container:
+
+- the current directory is `/home/dev/workspace/current`
+- extra read-write mounts appear under `/home/dev/workspace/_mounts/<name>`
+- `--mount-ro` exposes a folder read-only, which is useful for reference repos
+
+Notes:
+
+- `--mount /path/to/repo` uses the folder basename as `<name>`
+- `--mount /path/to/repo:alias` mounts it at `/home/dev/workspace/_mounts/alias`
+- if you need to pass `--mount` to the command inside the container, separate
+  launcher args from command args with `--`
+
 By default, the container-side `codex` wrapper disables the inner Codex `bwrap`
 sandbox and runs with `--sandbox danger-full-access`. This keeps Docker as the
 main isolation boundary and avoids nested sandbox failures such as
@@ -96,6 +127,8 @@ The launcher prints the current project and Codex state volume:
 
 ```text
 >> project: ...
+>> workspace root: /home/dev/workspace
+>> primary mount: ... -> /home/dev/workspace/current
 >> codex home volume: ...
 ```
 
@@ -152,6 +185,9 @@ The launcher refuses to start if the current directory is inside a known host se
 - `/run`
 - `/var/run`
 
+The same guardrails also apply to extra folders passed with `--mount` or
+`--mount-ro`.
+
 The container always runs with Docker `no-new-privileges`.
 
 ## MCP
@@ -171,8 +207,25 @@ Known limitation:
 
 - daily safe default: offline mode
 - real Codex development: `direct + writable`
+- mount extra repos only when they are needed for the task
+- prefer `--mount-ro` for reference code or docs you do not need to edit
 - do not mount host secret directories
 - do not rely on general host secret env vars inside the container
+
+## Isolation Impact
+
+Adding extra mounts does not change the container boundary itself:
+
+- network isolation still depends on `CODEX_NETWORK_MODE`
+- root filesystem isolation still depends on `CODEX_ROOTFS_MODE`
+- `no-new-privileges` still stays enabled
+
+What does change is host filesystem exposure:
+
+- every extra mount gives the container direct access to another host directory
+- read-write mounts allow edits to those host files from inside the container
+- Docker `--read-only` does not make bind mounts read-only; use `--mount-ro` if
+  you want that behavior
 
 ## Acknowledgements
 
