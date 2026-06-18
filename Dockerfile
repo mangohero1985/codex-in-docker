@@ -20,6 +20,7 @@ ENV RUSTUP_HOME=/home/dev/.rustup
 ENV PIPX_BIN_DIR=/home/dev/.local/bin
 ENV SWIFTLY_BIN_DIR=/home/dev/.swiftly/bin
 ENV PATH=/home/dev/.cargo/bin:/home/dev/.phpenv/bin:/home/dev/.phpenv/shims:/usr/local/go/bin:/home/dev/go/bin:/home/dev/.swiftly/bin:/home/dev/.local/bin:/home/dev/.pyenv/bin:/home/dev/.pyenv/shims:/home/dev/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ARG CODEX_VERSION
 
 RUN mkdir -p /home/dev/workspace /home/dev/.codex /home/dev/.config "${RUNTIME_ROOT}" \
  && chmod -R 777 /home/dev \
@@ -58,7 +59,8 @@ RUN if [ -d /root/.nvm ]; then mv /root/.nvm "${RUNTIME_ROOT}/nvm"; ln -s "${RUN
     fi \
  && ldconfig \
  && bash -lc 'source /root/.nvm/nvm.sh && DEFAULT_NODE_BIN="$(dirname "$(nvm which default)")" && for tool in node npm npx corepack; do ln -sf "$DEFAULT_NODE_BIN/$tool" "/usr/local/bin/$tool"; done' \
- && npm install -g @openai/codex \
+ && test -n "${CODEX_VERSION}" \
+ && npm install -g "@openai/codex@${CODEX_VERSION}" \
  && ln -sf "$(npm prefix -g)/bin/codex" /usr/local/bin/codex \
  && mv /usr/local/bin/codex /usr/local/bin/codex-real \
  && for tool in pnpm yarn bun cargo rustc rustup ruby gem bundle java javac gradle mvn elixir erl iex php composer; do \
