@@ -77,6 +77,7 @@ Important environment variables:
 - `CODEX_NETWORK_MODE=none|firewall|direct`
 - `CODEX_ROOTFS_MODE=readonly|writable`
 - `CODEX_DEPENDENCY_ISOLATION=enabled|disabled`
+- `CODEX_VERSION=<exact-version>`
 - `CODEX_CONTAINER_NAME=<name>`
 - `CODEX_MCP_OAUTH_CALLBACK_PORT=<port>`
 - `CODEX_HOME_VOLUME=<docker-volume-name>`
@@ -113,6 +114,7 @@ override the global defaults.
 - stores Codex state in a project-scoped Docker volume at `/home/dev/.codex`
 - uses explicit Docker names for the Codex container and its volumes
 - blocks obvious host secret paths and does not forward common secret env vars
+- checks the latest published `@openai/codex` version before launch and rebuilds the image when the installed version is behind
 - defaults to an offline, read-only container
 
 ## Extra Project Mounts
@@ -190,6 +192,13 @@ By default, the container-side `codex` wrapper disables the inner Codex `bwrap`
 sandbox and runs with `--sandbox danger-full-access`. This keeps Docker as the
 main isolation boundary and avoids nested sandbox failures such as
 `bwrap: No permissions to create a new namespace...`.
+
+The launcher chooses the Codex version before starting the container by using
+`CODEX_VERSION` when it is set. If `CODEX_VERSION` is unset, `run.sh` reuses the
+version recorded in the image label.
+
+When no version is recorded yet, set `CODEX_VERSION=<exact-version>` explicitly
+to force a rebuild.
 
 To restore the original Codex sandbox behavior for a single container session:
 

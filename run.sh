@@ -15,6 +15,7 @@ ROOTFS_MODE="${CODEX_ROOTFS_MODE:-readonly}"
 DEPENDENCY_ISOLATION_MODE="${CODEX_DEPENDENCY_ISOLATION:-enabled}"
 MCP_OAUTH_CALLBACK_PORT="${CODEX_MCP_OAUTH_CALLBACK_PORT:-}"
 CONTAINER_NAME_OVERRIDE="${CODEX_CONTAINER_NAME:-}"
+CODEX_VERSION_OVERRIDE="${CODEX_VERSION:-}"
 RUNTIME_STATE_DIR="${SCRIPT_DIR}/.tmp/runtime"
 PASSWD_FILE="${RUNTIME_STATE_DIR}/passwd"
 GROUP_FILE="${RUNTIME_STATE_DIR}/group"
@@ -125,6 +126,51 @@ sanitize_mount_name() {
   printf '%s' "${safe_name}"
 }
 
+array_length() {
+  local array_name="$1"
+  local count=0
+  local had_nounset=0
+
+  case "$-" in
+    *u*)
+      had_nounset=1
+      set +u
+      ;;
+  esac
+
+  eval "count=\${#${array_name}[@]}"
+
+  if [[ "${had_nounset}" -eq 1 ]]; then
+    set -u
+  fi
+
+  printf '%s\n' "${count}"
+}
+
+print_array_lines() {
+  local array_name="$1"
+  local count
+  local had_nounset=0
+
+  count="$(array_length "${array_name}")"
+  if [[ "${count}" -eq 0 ]]; then
+    return 0
+  fi
+
+  case "$-" in
+    *u*)
+      had_nounset=1
+      set +u
+      ;;
+  esac
+
+  eval "printf '%s\n' \"\${${array_name}[@]}\""
+
+  if [[ "${had_nounset}" -eq 1 ]]; then
+    set -u
+  fi
+}
+
 path_hash() {
   if command -v sha256sum >/dev/null 2>&1; then
     printf '%s' "$1" | sha256sum | cut -c1-10
@@ -150,6 +196,7 @@ register_extra_mount() {
   local target_path
   local existing_name
   local i
+  local extra_mount_name_count
 
   if mount_dir="$(canonicalize_dir "${spec}")"; then
     requested_name="$(basename "${mount_dir}")"
@@ -171,7 +218,8 @@ register_extra_mount() {
     safe_name="${safe_name}-$(path_hash "${mount_dir}")"
   fi
 
-  for ((i=0; i<${#EXTRA_MOUNT_NAMES[@]}; i++)); do
+  extra_mount_name_count="$(array_length EXTRA_MOUNT_NAMES)"
+  for ((i=0; i<extra_mount_name_count; i++)); do
     existing_name="${EXTRA_MOUNT_NAMES[i]}"
     if [[ "${mount_dir}" == "${EXTRA_MOUNT_DIRS[i]}" ]]; then
       echo "duplicate mount path requested: ${mount_dir}" >&2
@@ -230,9 +278,9 @@ collect_project_volume_names() {
   local root
   local rel_dir
 
-  for root in "${EXTRA_MOUNT_DIRS[@]}"; do
+  while IFS= read -r root; do
     roots+=("${root}")
-  done
+  done < <(print_array_lines EXTRA_MOUNT_DIRS)
 
   UNIQUE_VALUES=()
   append_unique_value "${CODEX_HOME_VOLUME}"
@@ -245,7 +293,7 @@ collect_project_volume_names() {
     done
   fi
 
-  printf '%s\n' "${UNIQUE_VALUES[@]}"
+  print_array_lines UNIQUE_VALUES
 }
 
 list_codex_volumes() {
@@ -350,8 +398,10 @@ parse_launcher_args() {
 }
 
 parse_launcher_args "$@"
-if [[ "${#DOCKER_COMMAND_ARGS[@]}" -gt 0 ]]; then
+if [[ "$(array_length DOCKER_COMMAND_ARGS)" -gt 0 ]]; then
+  set +u
   set -- "${DOCKER_COMMAND_ARGS[@]}"
+  set -u
 else
   set --
 fi
@@ -368,7 +418,7 @@ warn_ignored_sensitive_host_envs() {
     fi
   done
 
-  if [[ "${#warned[@]}" -gt 0 ]]; then
+  if [[ "$(array_length warned)" -gt 0 ]]; then
     printf '[security] host secret env vars detected but not forwarded: %s\n' "${warned[*]}" >&2
     echo "[security] only explicit Codex auth env vars are passed through to the container." >&2
   fi
@@ -557,6 +607,31 @@ context_hash() {
   fi | sha256sum | cut -c1-16
 }
 
+image_codex_version() {
+  docker image inspect "${IMAGE}" --format '{{index .Config.Labels "codex.version"}}' 2>/dev/null || true
+}
+
+resolve_target_codex_version() {
+  local image_version="$1"
+
+  if [[ -n "${CODEX_VERSION_OVERRIDE}" ]]; then
+    printf '%s\n' "${CODEX_VERSION_OVERRIDE}"
+    return 0
+  fi
+
+  if [[ -n "${image_version}" ]]; then
+    echo ">> reusing image version ${image_version}; set CODEX_VERSION to override it" >&2
+    printf '%s\n' "${image_version}"
+    return 0
+  fi
+
+  cat >&2 <<EOF
+unable to determine which Codex version to build.
+Set CODEX_VERSION=<version> explicitly to force a rebuild.
+EOF
+  return 1
+}
+
 case "${DEPENDENCY_ISOLATION_MODE}" in
   enabled|disabled)
     ;;
@@ -573,26 +648,49 @@ fi
 
 CURRENT_HASH="$(context_hash)"
 IMAGE_HASH="$(docker image inspect "${IMAGE}" --format '{{index .Config.Labels "build.context-hash"}}' 2>/dev/null || true)"
+IMAGE_CODEX_VERSION="$(image_codex_version)"
+TARGET_CODEX_VERSION=""
 
 if [[ "${PRINT_CODEX_HOME_VOLUME}" != true ]]; then
   assert_safe_mount_dir "${PROJECT_DIR}"
-  for mount_dir in "${EXTRA_MOUNT_DIRS[@]}"; do
+  while IFS= read -r mount_dir; do
     assert_safe_mount_dir "${mount_dir}"
-  done
+  done < <(print_array_lines EXTRA_MOUNT_DIRS)
   warn_ignored_sensitive_host_envs
+  TARGET_CODEX_VERSION="$(resolve_target_codex_version "${IMAGE_CODEX_VERSION}")"
 fi
 
+REBUILD_REQUIRED=false
 if [[ "${IMAGE_HASH}" != "${CURRENT_HASH}" ]]; then
+  REBUILD_REQUIRED=true
+fi
+if [[ "${PRINT_CODEX_HOME_VOLUME}" != true && "${IMAGE_CODEX_VERSION}" != "${TARGET_CODEX_VERSION}" ]]; then
+  REBUILD_REQUIRED=true
+fi
+
+if [[ "${REBUILD_REQUIRED}" == true ]]; then
   if [[ "${PRINT_CODEX_HOME_VOLUME}" == true ]]; then
     echo "codex-in-docker image is outdated; run the launcher normally once to rebuild it." >&2
     exit 1
   fi
   if [[ -n "${IMAGE_HASH}" ]]; then
-    echo ">> build context changed; rebuilding ${IMAGE}"
+    if [[ "${IMAGE_HASH}" != "${CURRENT_HASH}" && "${IMAGE_CODEX_VERSION}" != "${TARGET_CODEX_VERSION}" ]]; then
+      echo ">> build context changed and Codex ${TARGET_CODEX_VERSION} is required; rebuilding ${IMAGE}"
+    elif [[ "${IMAGE_HASH}" != "${CURRENT_HASH}" ]]; then
+      echo ">> build context changed; rebuilding ${IMAGE}"
+    else
+      echo ">> Codex ${TARGET_CODEX_VERSION} is newer than image version ${IMAGE_CODEX_VERSION:-unknown}; rebuilding ${IMAGE}"
+    fi
   else
-    echo ">> building ${IMAGE}"
+    echo ">> building ${IMAGE} with Codex ${TARGET_CODEX_VERSION}"
   fi
-  docker build --tag "${IMAGE}" --label "build.context-hash=${CURRENT_HASH}" "${SCRIPT_DIR}"
+  docker build \
+    --tag "${IMAGE}" \
+    --build-arg "CODEX_VERSION=${TARGET_CODEX_VERSION}" \
+    --label "build.context-hash=${CURRENT_HASH}" \
+    --label "codex.version=${TARGET_CODEX_VERSION}" \
+    "${SCRIPT_DIR}"
+  IMAGE_CODEX_VERSION="${TARGET_CODEX_VERSION}"
 fi
 
 mkdir -p "${RUNTIME_STATE_DIR}"
@@ -621,6 +719,7 @@ DOCKER_MOUNT_ARGS=(
 )
 DOCKER_ROOTFS_ARGS=()
 DOCKER_CONTAINER_ARGS=()
+extra_mount_count="$(array_length EXTRA_MOUNT_DIRS)"
 
 if [[ -n "${MCP_OAUTH_CALLBACK_PORT}" ]]; then
   if [[ ! "${MCP_OAUTH_CALLBACK_PORT}" =~ ^[0-9]+$ ]]; then
@@ -646,7 +745,7 @@ if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
   register_dependency_mounts "${PROJECT_DIR}" "${WORKSPACE_IN_CONTAINER}"
 fi
 
-for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
+for ((i=0; i<extra_mount_count; i++)); do
   mount_dir="${EXTRA_MOUNT_DIRS[i]}"
   target_path="${EXTRA_MOUNT_TARGETS[i]}"
   mount_mode="${EXTRA_MOUNT_MODES[i]}"
@@ -671,11 +770,12 @@ echo ">> workspace root: ${WORKSPACE_ROOT_IN_CONTAINER}"
 echo ">> primary mount: ${PROJECT_DIR} -> ${WORKSPACE_IN_CONTAINER}"
 echo ">> container name: ${CONTAINER_NAME}"
 echo ">> codex home volume: ${CODEX_HOME_VOLUME}"
+echo ">> codex version: ${IMAGE_CODEX_VERSION:-unknown}"
 echo ">> dependency isolation: ${DEPENDENCY_ISOLATION_MODE}"
 if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
   echo ">> isolated dependency dirs: ${DEPENDENCY_ISOLATED_DIRS[*]}"
 fi
-for ((i=0; i<${#EXTRA_MOUNT_DIRS[@]}; i++)); do
+for ((i=0; i<extra_mount_count; i++)); do
   mount_dir="${EXTRA_MOUNT_DIRS[i]}"
   target_path="${EXTRA_MOUNT_TARGETS[i]}"
   mount_mode="${EXTRA_MOUNT_MODES[i]}"
