@@ -50,13 +50,9 @@ HOST_CODEX_IMPORT_ITEMS=(
 )
 DEPENDENCY_ISOLATED_DIRS=(
   node_modules
-  .pnpm-store
-  .yarn
   .venv
   venv
   env
-  .tox
-  .nox
 )
 COMMON_PACKAGE_PARENT_DIRS=(
   apps

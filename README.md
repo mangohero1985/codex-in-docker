@@ -156,13 +156,9 @@ checkout.
 Current isolated directories:
 
 - `node_modules`
-- `.pnpm-store`
-- `.yarn`
 - `.venv`
 - `venv`
 - `env`
-- `.tox`
-- `.nox`
 
 This applies to both the primary project and extra mounts.
 
@@ -190,6 +186,8 @@ Important limits:
 - dependency manifests such as `package.json`, lockfiles, `requirements.txt`,
   `pyproject.toml`, or `.pnp.cjs` still live in the host checkout and can still
   be modified
+- Docker may still create empty host-side mountpoint directories for each
+  isolated path, so the defaults stay intentionally conservative
 - custom install targets outside the isolated directory list are not captured
 - if you disable this feature, dependency directories go back to the host bind
   mount behavior
@@ -201,7 +199,7 @@ Docker volume inside the container instead of writing back to the host checkout.
 Example:
 
 ```bash
-CODEX_ISOLATED_PATHS="packages/web/node_modules,apps/api/.venv,.cache/pip" \
+CODEX_ISOLATED_PATHS="packages/web/node_modules,apps/api/.venv,.pnpm-store,.yarn,.tox,.nox,.cache/pip" \
   bash /path/to/codex-in-docker/run.sh
 ```
 
