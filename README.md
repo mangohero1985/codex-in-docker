@@ -166,10 +166,22 @@ Current isolated directories:
 
 This applies to both the primary project and extra mounts.
 
+The launcher also isolates the same dependency directories for direct child
+projects under these common monorepo roots when they exist:
+
+- `apps/*`
+- `packages/*`
+- `services/*`
+- `libs/*`
+- `tools/*`
+- `examples/*`
+
 Example:
 
 - `npm install` writes package contents into the container volume mounted at
   `/home/dev/workspace/current/node_modules`
+- `cd packages/web && npm install` writes package contents into the container
+  volume mounted at `/home/dev/workspace/current/packages/web/node_modules`
 - `python -m venv .venv` writes the environment into the container volume
   mounted at `/home/dev/workspace/current/.venv`
 
@@ -181,6 +193,17 @@ Important limits:
 - custom install targets outside the isolated directory list are not captured
 - if you disable this feature, dependency directories go back to the host bind
   mount behavior
+
+For project-specific paths outside the defaults, set `CODEX_ISOLATED_PATHS` to a
+comma-separated list of relative paths. Each listed path is overlaid with a
+Docker volume inside the container instead of writing back to the host checkout.
+
+Example:
+
+```bash
+CODEX_ISOLATED_PATHS="packages/web/node_modules,apps/api/.venv,.cache/pip" \
+  bash /path/to/codex-in-docker/run.sh
+```
 
 To turn dependency isolation off for a session:
 

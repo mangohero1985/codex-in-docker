@@ -16,6 +16,7 @@ DEPENDENCY_ISOLATION_MODE="${CODEX_DEPENDENCY_ISOLATION:-enabled}"
 MCP_OAUTH_CALLBACK_PORT="${CODEX_MCP_OAUTH_CALLBACK_PORT:-}"
 CONTAINER_NAME_OVERRIDE="${CODEX_CONTAINER_NAME:-}"
 CODEX_VERSION_OVERRIDE="${CODEX_VERSION:-}"
+CUSTOM_ISOLATED_PATHS_RAW="${CODEX_ISOLATED_PATHS:-}"
 RUNTIME_STATE_DIR="${SCRIPT_DIR}/.tmp/runtime"
 PASSWD_FILE="${RUNTIME_STATE_DIR}/passwd"
 GROUP_FILE="${RUNTIME_STATE_DIR}/group"
@@ -56,6 +57,14 @@ DEPENDENCY_ISOLATED_DIRS=(
   env
   .tox
   .nox
+)
+COMMON_PACKAGE_PARENT_DIRS=(
+  apps
+  packages
+  services
+  libs
+  tools
+  examples
 )
 SENSITIVE_HOST_PATHS=(
   "${HOME}/.ssh"
@@ -171,6 +180,34 @@ print_array_lines() {
   fi
 }
 
+trim_whitespace() {
+  local value="$1"
+
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+normalize_relative_dependency_path() {
+  local path="$1"
+
+  path="$(trim_whitespace "${path}")"
+  path="${path#./}"
+  path="${path#/}"
+  while [[ "${path}" == *"//"* ]]; do
+    path="${path//\/\//\/}"
+  done
+
+  [[ -n "${path}" ]] || return 1
+  case "/${path}/" in
+    *"/../"*|*"/./"* )
+      return 1
+      ;;
+  esac
+
+  printf '%s\n' "${path%/}"
+}
+
 path_hash() {
   if command -v sha256sum >/dev/null 2>&1; then
     printf '%s' "$1" | sha256sum | cut -c1-10
@@ -248,16 +285,81 @@ dependency_volume_name() {
   printf 'codex-deps-%s-%s' "$(path_hash "${identity}")" "${safe_rel:-dir}"
 }
 
+list_dependency_relative_paths() {
+  local root_dir="$1"
+  local include_custom_paths="$2"
+  local rel_dir
+  local parent_dir
+  local child_dir
+  local child_name
+  local custom_path
+  local had_nullglob=0
+
+  UNIQUE_VALUES=()
+
+  for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
+    append_unique_value "${rel_dir}"
+  done
+
+  case "$(shopt -p nullglob 2>/dev/null || true)" in
+    *"-s nullglob"*)
+      had_nullglob=1
+      ;;
+  esac
+  shopt -s nullglob
+
+  for child_name in "${COMMON_PACKAGE_PARENT_DIRS[@]}"; do
+    parent_dir="${root_dir}/${child_name}"
+    [[ -d "${parent_dir}" ]] || continue
+    for child_dir in "${parent_dir}"/*; do
+      [[ -d "${child_dir}" ]] || continue
+      for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
+        append_unique_value "${child_name}/$(basename "${child_dir}")/${rel_dir}"
+      done
+    done
+  done
+
+  if [[ "${had_nullglob}" -eq 0 ]]; then
+    shopt -u nullglob
+  fi
+
+  if [[ "${include_custom_paths}" == "true" && -n "${CUSTOM_ISOLATED_PATHS_RAW}" ]]; then
+    while IFS= read -r custom_path; do
+      custom_path="$(trim_whitespace "${custom_path}")"
+      [[ -n "${custom_path}" ]] || continue
+      custom_path="$(normalize_relative_dependency_path "${custom_path}")" || {
+        echo "unsupported CODEX_ISOLATED_PATHS entry: ${custom_path}" >&2
+        echo "expected comma-separated relative paths such as packages/web/node_modules" >&2
+        exit 1
+      }
+      append_unique_value "${custom_path}"
+    done < <(printf '%s' "${CUSTOM_ISOLATED_PATHS_RAW}" | tr ',' '\n')
+  fi
+
+  print_array_lines UNIQUE_VALUES
+}
+
+register_dependency_path_mount() {
+  local identity="$1"
+  local container_base="$2"
+  local rel_dir="$3"
+  local volume_name
+
+  volume_name="$(dependency_volume_name "${identity}:${rel_dir}" "${rel_dir}")"
+  DOCKER_MOUNT_ARGS+=(--volume "${volume_name}:${container_base}/${rel_dir}")
+}
+
 register_dependency_mounts() {
   local identity="$1"
   local container_base="$2"
+  local host_root="$3"
+  local include_custom_paths="$4"
   local rel_dir
-  local volume_name
 
-  for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
-    volume_name="$(dependency_volume_name "${identity}:${rel_dir}" "${rel_dir}")"
-    DOCKER_MOUNT_ARGS+=(--volume "${volume_name}:${container_base}/${rel_dir}")
-  done
+  while IFS= read -r rel_dir; do
+    [[ -n "${rel_dir}" ]] || continue
+    register_dependency_path_mount "${identity}" "${container_base}" "${rel_dir}"
+  done < <(list_dependency_relative_paths "${host_root}" "${include_custom_paths}")
 }
 
 append_unique_value() {
@@ -277,6 +379,7 @@ collect_project_volume_names() {
   local roots=("${PROJECT_DIR}")
   local root
   local rel_dir
+  local i
 
   while IFS= read -r root; do
     roots+=("${root}")
@@ -286,10 +389,17 @@ collect_project_volume_names() {
   append_unique_value "${CODEX_HOME_VOLUME}"
 
   if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
-    for root in "${roots[@]}"; do
-      for rel_dir in "${DEPENDENCY_ISOLATED_DIRS[@]}"; do
+    while IFS= read -r rel_dir; do
+      [[ -n "${rel_dir}" ]] || continue
+      append_unique_value "$(dependency_volume_name "${PROJECT_DIR}:${rel_dir}" "${rel_dir}")"
+    done < <(list_dependency_relative_paths "${PROJECT_DIR}" true)
+
+    for ((i=1; i<${#roots[@]}; i++)); do
+      root="${roots[i]}"
+      while IFS= read -r rel_dir; do
+        [[ -n "${rel_dir}" ]] || continue
         append_unique_value "$(dependency_volume_name "${root}:${rel_dir}" "${rel_dir}")"
-      done
+      done < <(list_dependency_relative_paths "${root}" false)
     done
   fi
 
@@ -742,7 +852,7 @@ DOCKER_CONTAINER_ARGS+=(
 )
 
 if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
-  register_dependency_mounts "${PROJECT_DIR}" "${WORKSPACE_IN_CONTAINER}"
+  register_dependency_mounts "${PROJECT_DIR}" "${WORKSPACE_IN_CONTAINER}" "${PROJECT_DIR}" true
 fi
 
 for ((i=0; i<extra_mount_count; i++)); do
@@ -751,7 +861,7 @@ for ((i=0; i<extra_mount_count; i++)); do
   mount_mode="${EXTRA_MOUNT_MODES[i]}"
   DOCKER_MOUNT_ARGS+=(--volume "${mount_dir}:${target_path}:${mount_mode}")
   if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
-    register_dependency_mounts "${mount_dir}" "${target_path}"
+    register_dependency_mounts "${mount_dir}" "${target_path}" "${mount_dir}" false
   fi
 done
 
@@ -774,6 +884,10 @@ echo ">> codex version: ${IMAGE_CODEX_VERSION:-unknown}"
 echo ">> dependency isolation: ${DEPENDENCY_ISOLATION_MODE}"
 if [[ "${DEPENDENCY_ISOLATION_MODE}" == "enabled" ]]; then
   echo ">> isolated dependency dirs: ${DEPENDENCY_ISOLATED_DIRS[*]}"
+  echo ">> common package roots: ${COMMON_PACKAGE_PARENT_DIRS[*]}"
+  if [[ -n "${CUSTOM_ISOLATED_PATHS_RAW}" ]]; then
+    echo ">> custom isolated paths: ${CUSTOM_ISOLATED_PATHS_RAW}"
+  fi
 fi
 for ((i=0; i<extra_mount_count; i++)); do
   mount_dir="${EXTRA_MOUNT_DIRS[i]}"
