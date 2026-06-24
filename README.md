@@ -266,6 +266,25 @@ Naming notes:
 - you can override the container name for one launch with
   `CODEX_CONTAINER_NAME=my-codex-session`
 
+## Cmd Shortcut
+```
+export CODEX_IN_DOCKER_HOME=/path/to/codex-in-docker
+export CODEX_IN_DOCKER_BUILDX_CONFIG=$CODEX_IN_DOCKER_HOME/.tmp/buildx
+
+dcodex() {
+  mkdir -p "$CODEX_IN_DOCKER_BUILDX_CONFIG" && \
+  BUILDX_CONFIG="$CODEX_IN_DOCKER_BUILDX_CONFIG" \
+  bash "$CODEX_IN_DOCKER_HOME/run.sh" "$@"
+}
+
+dcodex-online() {
+  mkdir -p "$CODEX_IN_DOCKER_BUILDX_CONFIG" && \
+  BUILDX_CONFIG="$CODEX_IN_DOCKER_BUILDX_CONFIG" \
+  CODEX_NETWORK_MODE=direct \
+  CODEX_ROOTFS_MODE=writable \
+  bash "$CODEX_IN_DOCKER_HOME/run.sh" "$@"
+}
+```
 ## Host Config Import
 
 On startup, the launcher syncs these host-side Codex assets from `~/.codex` into the project volume whenever their content changes:
